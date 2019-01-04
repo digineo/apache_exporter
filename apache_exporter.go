@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
 )
@@ -23,7 +24,8 @@ const (
 var (
 	listeningAddress = flag.String("telemetry.address", ":9117", "Address on which to expose metrics.")
 	metricsEndpoint  = flag.String("telemetry.endpoint", "/metrics", "Path under which to expose metrics.")
-	scrapeURI        = flag.String("scrape_uri", "http://localhost/server-status/?auto", "URI to apache stub status page.")
+	targetsEndpoint  = flag.String("telemetry.targets", "/probe", "Path under which to expose dynamic metrics.")
+	scrapeURI        = flag.String("scrape_uri", "http://localhost/server-status/?auto", "URI to apache stub status page for '-telemetry.endpoint'.")
 	insecure         = flag.Bool("insecure", false, "Ignore server certificate if using https.")
 	showVersion      = flag.Bool("version", false, "Print version information.")
 )
@@ -307,6 +309,19 @@ func main() {
 	log.Infof("Starting Server: %s", *listeningAddress)
 
 	http.Handle(*metricsEndpoint, prometheus.Handler())
+	http.HandleFunc(*targetsEndpoint, func(w http.ResponseWriter, r *http.Request) {
+		target := r.FormValue("target")
+		if target == "" {
+			http.Error(w, "bad request: missing target parameter", http.StatusBadRequest)
+			return
+		}
+		reg := prometheus.NewRegistry()
+		exporter := NewExporter(target)
+		reg.MustRegister(exporter)
+		h := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
+		h.ServeHTTP(w, r)
+
+	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
 			 <head><title>Apache Exporter</title></head>
