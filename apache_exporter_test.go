@@ -104,6 +104,10 @@ Scoreboard: _W_______K..........................................................
 	metricCountApache24Worker = 18
 )
 
+func init() {
+	client = &http.Client{}
+}
+
 func checkApacheStatus(t *testing.T, status string, metricCount int) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(status))

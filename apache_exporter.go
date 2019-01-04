@@ -17,35 +17,37 @@ import (
 	"github.com/prometheus/common/version"
 )
 
-const (
-	namespace = "apache" // For Prometheus metrics.
-)
+// For Prometheus metrics.
+const namespace = "apache"
 
+// CLI flags
 var (
-	listeningAddress = flag.String("telemetry.address", ":9117", "Address on which to expose metrics.")
-	metricsEndpoint  = flag.String("telemetry.endpoint", "/metrics", "Path under which to expose metrics.")
-	targetsEndpoint  = flag.String("telemetry.targets", "/probe", "Path under which to expose dynamic metrics.")
-	scrapeURI        = flag.String("scrape_uri", "http://localhost/server-status/?auto", "URI to apache stub status page for '-telemetry.endpoint'.")
-	insecure         = flag.Bool("insecure", false, "Ignore server certificate if using https.")
-	showVersion      = flag.Bool("version", false, "Print version information.")
+	listeningAddress = ":9117"
+	metricsEndpoint  = "/metrics"
+	insecure         = false
+	showVersion      = false
+
+	client *http.Client
 )
 
+// Exporter holds metrics for a single target.
 type Exporter struct {
-	URI    string
-	mutex  sync.Mutex
-	client *http.Client
+	URI string
 
 	up             *prometheus.Desc
 	scrapeFailures prometheus.Counter
 	accessesTotal  *prometheus.Desc
-	kBytesTotal    *prometheus.Desc
+	bytesTotal     *prometheus.Desc
 	cpuload        prometheus.Gauge
 	uptime         *prometheus.Desc
 	workers        *prometheus.GaugeVec
 	scoreboard     *prometheus.GaugeVec
 	connections    *prometheus.GaugeVec
+
+	sync.Mutex // To protect metrics from concurrent collects.
 }
 
+// NewExporter returns a new exporter for the given target uri.
 func NewExporter(uri string) *Exporter {
 	return &Exporter{
 		URI: uri,
@@ -64,9 +66,9 @@ func NewExporter(uri string) *Exporter {
 			"Current total apache accesses (*)",
 			nil,
 			nil),
-		kBytesTotal: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "", "sent_kilobytes_total"),
-			"Current total kbytes sent (*)",
+		bytesTotal: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "", "sent_bytes_total"),
+			"Current total bytes sent (*)",
 			nil,
 			nil),
 		cpuload: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -83,35 +85,25 @@ func NewExporter(uri string) *Exporter {
 			Namespace: namespace,
 			Name:      "workers",
 			Help:      "Apache worker statuses",
-		},
-			[]string{"state"},
-		),
+		}, []string{"state"}),
 		scoreboard: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "scoreboard",
 			Help:      "Apache scoreboard statuses",
-		},
-			[]string{"state"},
-		),
+		}, []string{"state"}),
 		connections: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "connections",
 			Help:      "Apache connection statuses",
-		},
-			[]string{"state"},
-		),
-		client: &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: *insecure},
-			},
-		},
+		}, []string{"state"}),
 	}
 }
 
+// Describe implements the prometheus.Collector interface
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.up
 	ch <- e.accessesTotal
-	ch <- e.kBytesTotal
+	ch <- e.bytesTotal
 	ch <- e.uptime
 	e.cpuload.Describe(ch)
 	e.scrapeFailures.Describe(ch)
@@ -120,34 +112,31 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	e.connections.Describe(ch)
 }
 
-// Split colon separated string into two fields
+// splitkv splits colon separated string into two fields
 func splitkv(s string) (string, string) {
-
 	if len(s) == 0 {
 		return s, s
 	}
 
 	slice := strings.SplitN(s, ":", 2)
-
 	if len(slice) == 1 {
 		return slice[0], ""
 	}
-
 	return strings.TrimSpace(slice[0]), strings.TrimSpace(slice[1])
 }
 
-var scoreboardLabelMap = map[string]string{
-	"_": "idle",
-	"S": "startup",
-	"R": "read",
-	"W": "reply",
-	"K": "keepalive",
-	"D": "dns",
-	"C": "closing",
-	"L": "logging",
-	"G": "graceful_stop",
-	"I": "idle_cleanup",
-	".": "open_slot",
+var scoreboardLabelMap = map[rune]string{
+	'_': "idle",
+	'S': "startup",
+	'R': "read",
+	'W': "reply",
+	'K': "keepalive",
+	'D': "dns",
+	'C': "closing",
+	'L': "logging",
+	'G': "graceful_stop",
+	'I': "idle_cleanup",
+	'.': "open_slot",
 }
 
 func (e *Exporter) updateScoreboard(scoreboard string) {
@@ -156,18 +145,17 @@ func (e *Exporter) updateScoreboard(scoreboard string) {
 		e.scoreboard.WithLabelValues(v)
 	}
 
-	for _, worker_status := range scoreboard {
-		s := string(worker_status)
-		label, ok := scoreboardLabelMap[s]
+	for _, status := range scoreboard {
+		label, ok := scoreboardLabelMap[status]
 		if !ok {
-			label = s
+			label = string(status)
 		}
 		e.scoreboard.WithLabelValues(label).Inc()
 	}
 }
 
 func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
-	resp, err := e.client.Get(e.URI)
+	resp, err := client.Get(e.URI)
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 0)
 		return fmt.Errorf("Error scraping apache: %v", err)
@@ -193,84 +181,72 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 			continue
 		}
 
-		switch {
-		case key == "Total Accesses":
-			val, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return err
-			}
+		var val float64
+		var err error
 
-			ch <- prometheus.MustNewConstMetric(e.accessesTotal, prometheus.CounterValue, val)
-		case key == "Total kBytes":
-			val, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return err
+		switch key {
+		case "Total Accesses":
+			val, err = strconv.ParseFloat(v, 64)
+			if err == nil {
+				ch <- prometheus.MustNewConstMetric(e.accessesTotal, prometheus.CounterValue, val)
 			}
-
-			ch <- prometheus.MustNewConstMetric(e.kBytesTotal, prometheus.CounterValue, val)
-		case key == "CPULoad":
-			val, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return err
+		case "Total kBytes":
+			val, err = strconv.ParseFloat(v, 64)
+			if err == nil {
+				ch <- prometheus.MustNewConstMetric(e.bytesTotal, prometheus.CounterValue, val*1024)
 			}
-
-			e.cpuload.Set(val)
-		case key == "Uptime":
-			val, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return err
+		case "CPULoad":
+			val, err = strconv.ParseFloat(v, 64)
+			if err == nil {
+				e.cpuload.Set(val)
 			}
-
-			ch <- prometheus.MustNewConstMetric(e.uptime, prometheus.CounterValue, val)
-		case key == "BusyWorkers":
-			val, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return err
+		case "Uptime":
+			val, err = strconv.ParseFloat(v, 64)
+			if err == nil {
+				ch <- prometheus.MustNewConstMetric(e.uptime, prometheus.CounterValue, val)
 			}
-
-			e.workers.WithLabelValues("busy").Set(val)
-		case key == "IdleWorkers":
-			val, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return err
+		case "BusyWorkers":
+			val, err = strconv.ParseFloat(v, 64)
+			if err == nil {
+				e.workers.WithLabelValues("busy").Set(val)
 			}
-
-			e.workers.WithLabelValues("idle").Set(val)
-		case key == "Scoreboard":
+		case "IdleWorkers":
+			val, err = strconv.ParseFloat(v, 64)
+			if err == nil {
+				e.workers.WithLabelValues("idle").Set(val)
+			}
+		case "Scoreboard":
 			e.updateScoreboard(v)
 			e.scoreboard.Collect(ch)
-		case key == "ConnsTotal":
-			val, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return err
+		case "ConnsTotal":
+			val, err = strconv.ParseFloat(v, 64)
+			if err == nil {
+				e.connections.WithLabelValues("total").Set(val)
+				connectionInfo = true
 			}
-
-			e.connections.WithLabelValues("total").Set(val)
-			connectionInfo = true
-		case key == "ConnsAsyncWriting":
-			val, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return err
+		case "ConnsAsyncWriting":
+			val, err = strconv.ParseFloat(v, 64)
+			if err == nil {
+				e.connections.WithLabelValues("writing").Set(val)
+				connectionInfo = true
 			}
-
-			e.connections.WithLabelValues("writing").Set(val)
-			connectionInfo = true
-		case key == "ConnsAsyncKeepAlive":
-			val, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return err
+		case "ConnsAsyncKeepAlive":
+			val, err = strconv.ParseFloat(v, 64)
+			if err == nil {
+				e.connections.WithLabelValues("keepalive").Set(val)
+				connectionInfo = true
 			}
-			e.connections.WithLabelValues("keepalive").Set(val)
-			connectionInfo = true
-		case key == "ConnsAsyncClosing":
-			val, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return err
+		case "ConnsAsyncClosing":
+			val, err = strconv.ParseFloat(v, 64)
+			if err == nil {
+				e.connections.WithLabelValues("closing").Set(val)
+				connectionInfo = true
 			}
-			e.connections.WithLabelValues("closing").Set(val)
-			connectionInfo = true
 		}
 
+		if err != nil {
+			return err
+		}
 	}
 
 	e.cpuload.Collect(ch)
@@ -282,37 +258,47 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 	return nil
 }
 
+// Collect implements the prometheus.Collector interface
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
-	e.mutex.Lock() // To protect metrics from concurrent collects.
-	defer e.mutex.Unlock()
+	e.Lock()
 	if err := e.collect(ch); err != nil {
 		log.Errorf("Error scraping apache: %s", err)
 		e.scrapeFailures.Inc()
 		e.scrapeFailures.Collect(ch)
 	}
+	e.Unlock()
 	return
 }
 
 func main() {
+	flag.StringVar(&listeningAddress, "telemetry.address", listeningAddress, "Address on which to expose metrics")
+	flag.StringVar(&metricsEndpoint, "telemetry.endpoint", metricsEndpoint, "Path under which to expose metrics")
+	flag.BoolVar(&insecure, "insecure", insecure, "Ignore server certificate if using https")
+	flag.BoolVar(&showVersion, "version", showVersion, "Print version information")
 	flag.Parse()
 
-	if *showVersion {
-		fmt.Fprintln(os.Stdout, version.Print("apache_exporter"))
+	if showVersion {
+		fmt.Println(version.Print("apache_exporter"))
 		os.Exit(0)
 	}
-	exporter := NewExporter(*scrapeURI)
-	prometheus.MustRegister(exporter)
+
+	client = &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
+		},
+	}
+
 	prometheus.MustRegister(version.NewCollector("apache_exporter"))
+	defaultHandler := prometheus.Handler()
 
 	log.Infoln("Starting apache_exporter", version.Info())
 	log.Infoln("Build context", version.BuildContext())
-	log.Infof("Starting Server: %s", *listeningAddress)
+	log.Infof("Starting Server: %s", listeningAddress)
 
-	http.Handle(*metricsEndpoint, prometheus.Handler())
-	http.HandleFunc(*targetsEndpoint, func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(metricsEndpoint, func(w http.ResponseWriter, r *http.Request) {
 		target := r.FormValue("target")
 		if target == "" {
-			http.Error(w, "bad request: missing target parameter", http.StatusBadRequest)
+			defaultHandler.ServeHTTP(w, r)
 			return
 		}
 		reg := prometheus.NewRegistry()
@@ -320,16 +306,23 @@ func main() {
 		reg.MustRegister(exporter)
 		h := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 		h.ServeHTTP(w, r)
+	})
 
-	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
-			 <head><title>Apache Exporter</title></head>
-			 <body>
-			 <h1>Apache Exporter</h1>
-			 <p><a href='` + *metricsEndpoint + `'>Metrics</a></p>
-			 </body>
-			 </html>`))
+		fmt.Fprintf(w, landingPage, metricsEndpoint)
 	})
-	log.Fatal(http.ListenAndServe(*listeningAddress, nil))
+	log.Fatal(http.ListenAndServe(listeningAddress, nil))
 }
+
+const landingPage = `<!doctype html><html>
+<head>
+	<meta charset="UTF-8">
+	<title>Apache Exporter</title>
+</head>
+<body>
+	<h1>Apache Exporter</h1>
+	<p><a href="%s">Metrics</a></p>
+	<p><a href="https://github.com/digineo/apache_exporter">Sources</a></p>
+</body>
+</html>
+`
