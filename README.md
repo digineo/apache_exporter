@@ -14,8 +14,6 @@ Usage of apache_exporter:
     	Ignore server certificate if using https
   -telemetry.address string
     	Address on which to expose metrics (default ":9117")
-  -telemetry.endpoint string
-    	Path under which to expose metrics (default "/metrics")
   -version
     	Print version information
 ```

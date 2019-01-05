@@ -20,14 +20,15 @@ import (
 // For Prometheus metrics.
 const namespace = "apache"
 
-// CLI flags
 var (
+	// CLI flags
 	listeningAddress = ":9117"
 	metricsEndpoint  = "/metrics"
 	insecure         = false
 	showVersion      = false
 
-	client *http.Client
+	defaultTarget = "http://localhost/server-status?auto"
+	client        *http.Client
 )
 
 // Exporter holds metrics for a single target.
@@ -262,7 +263,7 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.Lock()
 	if err := e.collect(ch); err != nil {
-		log.Errorf("Error scraping apache: %s", err)
+		log.Errorf("Error scraping target '%s': %s", e.URI, err)
 		e.scrapeFailures.Inc()
 		e.scrapeFailures.Collect(ch)
 	}
@@ -272,7 +273,6 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
 func main() {
 	flag.StringVar(&listeningAddress, "telemetry.address", listeningAddress, "Address on which to expose metrics")
-	flag.StringVar(&metricsEndpoint, "telemetry.endpoint", metricsEndpoint, "Path under which to expose metrics")
 	flag.BoolVar(&insecure, "insecure", insecure, "Ignore server certificate if using https")
 	flag.BoolVar(&showVersion, "version", showVersion, "Print version information")
 	flag.Parse()
@@ -284,32 +284,37 @@ func main() {
 
 	client = &http.Client{
 		Transport: &http.Transport{
+			Proxy:           http.ProxyFromEnvironment,
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
 		},
 	}
-
-	prometheus.MustRegister(version.NewCollector("apache_exporter"))
-	defaultHandler := prometheus.Handler()
 
 	log.Infoln("Starting apache_exporter", version.Info())
 	log.Infoln("Build context", version.BuildContext())
 	log.Infof("Starting Server: %s", listeningAddress)
 
 	http.HandleFunc(metricsEndpoint, func(w http.ResponseWriter, r *http.Request) {
-		target := r.FormValue("target")
-		if target == "" {
-			defaultHandler.ServeHTTP(w, r)
-			return
-		}
 		reg := prometheus.NewRegistry()
-		exporter := NewExporter(target)
-		reg.MustRegister(exporter)
+
+		if r.FormValue("runtime") != "false" {
+			reg.MustRegister(version.NewCollector("apache_exporter"))
+			reg.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+			reg.MustRegister(prometheus.NewGoCollector())
+		}
+
+		if target := r.FormValue("target"); target != "false" {
+			if target == "" {
+				target = defaultTarget
+			}
+			reg.MustRegister(NewExporter(target))
+		}
+
 		h := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 		h.ServeHTTP(w, r)
 	})
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, landingPage, metricsEndpoint)
+		fmt.Fprint(w, landingPage)
 	})
 	log.Fatal(http.ListenAndServe(listeningAddress, nil))
 }
@@ -321,7 +326,12 @@ const landingPage = `<!doctype html><html>
 </head>
 <body>
 	<h1>Apache Exporter</h1>
-	<p><a href="%s">Metrics</a></p>
+	<ul>
+		<li><a href="/metrics">Runtime Metrics with default probe</a></li>
+		<li><a href="/metrics?runtime=false&target=http%3A%2F%2Flocalhost%2Fserver-status%3Fauto>Runtime Metrics with specific probe</a></li>
+		<li><a href="/metrics?target=false">Runtime Metrics without probe</a></li>
+		<li><a href="/metrics?runtime=false&target=http%3A%2F%2Flocalhost%2Fserver-status%3Fauto">Only http://localhost/server-status?auto</a></li>
+	</ul>
 	<p><a href="https://github.com/digineo/apache_exporter">Sources</a></p>
 </body>
 </html>
