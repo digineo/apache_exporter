@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,7 +18,8 @@ const namespace = "apache"
 
 // Exporter holds metrics for a single target.
 type Exporter struct {
-	URI string
+	Context context.Context
+	URI     string
 
 	up             *prometheus.Desc
 	scrapeFailures prometheus.Counter
@@ -32,9 +35,10 @@ type Exporter struct {
 }
 
 // NewExporter returns a new exporter for the given target uri.
-func NewExporter(uri string) *Exporter {
+func NewExporter(ctx context.Context, uri string) *Exporter {
 	return &Exporter{
-		URI: uri,
+		Context: ctx,
+		URI:     uri,
 		up: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", "up"),
 			"Could the apache server be reached",
@@ -139,7 +143,13 @@ func (e *Exporter) updateScoreboard(scoreboard string) {
 }
 
 func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
-	resp, err := client.Get(e.URI)
+	req, err := http.NewRequest("GET", e.URI, nil)
+	if err != nil {
+		return err
+	}
+	req = req.WithContext(e.Context)
+
+	resp, err := client.Do(req)
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 0)
 		return fmt.Errorf("Error scraping apache: %v", err)

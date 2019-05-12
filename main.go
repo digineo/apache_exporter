@@ -59,7 +59,7 @@ func main() {
 			if target == "" {
 				target = defaultTarget
 			}
-			reg.MustRegister(NewExporter(target))
+			reg.MustRegister(NewExporter(r.Context(), target))
 		}
 
 		h := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
